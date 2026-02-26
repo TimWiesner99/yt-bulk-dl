@@ -1,6 +1,6 @@
 # YouTube Bulk Downloader
 
-Single-file Python script that batch-downloads YouTube videos in the highest available quality. Reads URLs from a text file, merges the best video + audio streams, and optionally fetches manually-added subtitles as `.srt` sidecar files.
+Single-file Python script that batch-downloads YouTube videos in the highest available quality. Reads URLs from a text file, merges the best video + audio streams, downloads multiple videos in parallel, and optionally fetches manually-added subtitles as `.srt` sidecar files.
 
 ## Requirements
 
@@ -19,34 +19,53 @@ https://www.youtube.com/watch?v=abc123
 # Lines starting with # are ignored
 ```
 
-3. Run the script — downloads go to `./download/`.
+3. Run the script — downloads go to `~/Downloads/yt-bulk download/<yy-mm-dd HH-MM>/`.
 
 ## Usage
 
 ```bash
-# Basic download
+# Basic download (4 parallel workers)
 python yt_bulk_download.py
 
 # Add a prefix to all filenames
 python yt_bulk_download.py -p DL_monday
 
-# Prefix + custom max title length (default: 30 characters)
+# Prefix + custom max title length (default: 40 characters)
 python yt_bulk_download.py -p DL_monday -l 50
+
+# Use 8 parallel download workers instead of the default 4
+python yt_bulk_download.py -w 8
+
+# All options combined
+python yt_bulk_download.py -p DL_monday -l 50 -w 8
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-p`, `--prefix` | String prepended to every filename |
-| `-l`, `--max-length` | Max characters for the title portion (default: 30) |
+| `-l`, `--max-length` | Max characters for the title portion (default: 40) |
+| `-w`, `--workers` | Number of videos downloaded in parallel (default: 4) |
 
-## Output example
+## Output
+
+Each run creates a timestamped subfolder inside `~/Downloads/yt-bulk download/`:
 
 ```
-download/
-├── DL_monday_Rick_Astley_Never_Gonna_Gi.mp4
-├── DL_monday_Rick_Astley_Never_Gonna_Gi.en.srt
-└── DL_monday_Some_Other_Video_Title_Her.mp4
+~/Downloads/yt-bulk download/
+└── 26-02-26 14-30/
+    ├── DL_monday_Rick_Astley_Never_Gonna_Give_You_Up.mp4
+    ├── DL_monday_Rick_Astley_Never_Gonna_Give_You_Up.en.srt
+    ├── DL_monday_Some_Other_Video_Title_Here_In_Full.mp4
+    └── metadata.csv
 ```
+
+`metadata.csv` contains one row per URL from `download-list.txt` (in input order), with columns: `filename`, `youtube_title`, `channel`, `upload_date`, `youtube_url`.
+
+## Parallel downloads
+
+By default, 4 videos are downloaded simultaneously. Each worker runs its own independent `yt-dlp` instance, so progress output from multiple downloads will be interleaved in the terminal. The order of rows in `metadata.csv` always matches the order of URLs in `download-list.txt` regardless of which download finishes first.
+
+Increase `-w` for faster bulk runs (e.g. `-w 8`). Very high values (>8) are unlikely to help and may trigger YouTube rate-limiting.
 
 ## Notes
 

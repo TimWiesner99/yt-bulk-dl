@@ -2,12 +2,14 @@
 """
 Bulk YouTube Video Downloader
 Reads YouTube links from 'download-list.txt' (one per line) and downloads
-each video in the highest available quality to a './download' directory.
+each video in the highest available quality. Downloads are parallelised across
+multiple worker threads so that several videos are fetched simultaneously.
 
 Usage:
-    python yt_bulk_download.py                          # basic download
+    python yt_bulk_download.py                          # basic download (4 workers)
     python yt_bulk_download.py -p DL_monday             # add prefix to filenames
     python yt_bulk_download.py -p DL_monday -l 50       # prefix + custom title length
+    python yt_bulk_download.py -w 8                     # use 8 parallel download workers
 
 Requirements:
     pip install yt-dlp
@@ -23,6 +25,9 @@ import csv
 import json
 import subprocess
 import argparse
+import datetime
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 try:
@@ -33,10 +38,15 @@ except ImportError:
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DOWNLOAD_DIR = SCRIPT_DIR / "download"
+BASE_DOWNLOAD_DIR = Path.home() / "Downloads" / "yt-bulk download"
 LINK_FILE = SCRIPT_DIR / "download-list.txt"
 
-DEFAULT_MAX_TITLE_LEN = 30
+DEFAULT_MAX_TITLE_LEN = 40
+DEFAULT_WORKERS = 4
+
+# Lock that serialises the check-then-rename step inside RenamePostProcessor
+# to prevent TOCTOU races when two threads try to rename to the same filename.
+_rename_lock = threading.Lock()
 
 
 def sanitize_title(title: str, max_len: int) -> str:
@@ -51,7 +61,7 @@ def sanitize_title(title: str, max_len: int) -> str:
     return clean
 
 
-def build_outtmpl(prefix: str | None, max_len: int) -> str:
+def build_outtmpl(download_dir: Path) -> str:
     """
     Build the yt-dlp output template string.
 
@@ -62,7 +72,7 @@ def build_outtmpl(prefix: str | None, max_len: int) -> str:
     So during download we use a temp name (the video ID), then rename after.
     """
     # Temporary name while downloading — the ID is always unique and filesystem-safe
-    return str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
+    return str(download_dir / "%(id)s.%(ext)s")
 
 
 def rename_file(filepath: str, prefix: str | None, max_len: int) -> str:
@@ -192,8 +202,9 @@ class RenamePostProcessor(yt_dlp.postprocessor.PostProcessor):
         ext = old_path.suffix                          # e.g. '.mp4'
         new_path = old_path.parent / f"{new_base}{ext}"
         if old_path.exists() and old_path != new_path:
-            new_path = _unique_path(new_path)          # avoid collisions
-            old_path.rename(new_path)
+            with _rename_lock:                         # serialise check+rename across threads
+                new_path = _unique_path(new_path)
+                old_path.rename(new_path)
             info["filepath"] = str(new_path)
             self.to_screen(f"Renamed → {new_path.name}")
 
@@ -202,8 +213,9 @@ class RenamePostProcessor(yt_dlp.postprocessor.PostProcessor):
             lang_ext = srt.name.removeprefix(f"{video_id}")  # e.g. '.en.srt'
             new_srt = srt.parent / f"{new_base}{lang_ext}"
             if srt.exists() and srt != new_srt:
-                new_srt = _unique_path(new_srt)
-                srt.rename(new_srt)
+                with _rename_lock:
+                    new_srt = _unique_path(new_srt)
+                    srt.rename(new_srt)
 
         return [], info  # (list of files to delete, updated info dict)
 
@@ -259,7 +271,7 @@ def write_metadata_csv(rows: list[dict], output_path: Path):
             ])
 
 
-def build_opts(prefix: str | None, max_len: int) -> dict:
+def build_opts(prefix: str | None, max_len: int, download_dir: Path) -> dict:
     """Construct the full yt-dlp options dict."""
     return {
         # Prefer H264 (avc1) video + AAC audio; fall back to best available
@@ -271,7 +283,7 @@ def build_opts(prefix: str | None, max_len: int) -> dict:
             "best"
         ),
         "merge_output_format": "mp4",
-        "outtmpl": build_outtmpl(prefix, max_len),
+        "outtmpl": build_outtmpl(download_dir),
         "ignoreerrors": True,
         "retries": 5,
         "fragment_retries": 5,
@@ -316,7 +328,31 @@ def parse_args() -> argparse.Namespace:
         help=f"Max character length for the title portion of the filename "
              f"(default: {DEFAULT_MAX_TITLE_LEN}).",
     )
+    parser.add_argument(
+        "-w", "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Number of videos to download in parallel (default: {DEFAULT_WORKERS}).",
+    )
     return parser.parse_args()
+
+
+def download_one(link: str, opts: dict, prefix: str | None, max_len: int) -> dict:
+    """Download a single video using a dedicated YoutubeDL instance.
+
+    Each call creates its own YoutubeDL object so that multiple threads can
+    run downloads concurrently without sharing state.  Returns a metadata dict
+    suitable for appending to the CSV rows list.
+    """
+    collector = MetadataCollector()
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.add_post_processor(EnsureH264PostProcessor(), when="post_process")
+        ydl.add_post_processor(RenamePostProcessor(prefix, max_len), when="post_process")
+        ydl.add_post_processor(collector, when="post_process")
+        ydl.download([link])
+    return collector.last_entry or {
+        "filename": "", "title": "", "channel": "", "upload_date": "", "url": link,
+    }
 
 
 def main():
@@ -327,49 +363,28 @@ def main():
         print("No links found in download-list.txt — nothing to do.")
         return
 
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    batch_ts = datetime.datetime.now().strftime("%y-%m-%d %H-%M")
+    download_dir = BASE_DOWNLOAD_DIR / batch_ts
+    download_dir.mkdir(parents=True, exist_ok=True)
 
-    opts = build_opts(args.prefix, args.max_length)
+    opts = build_opts(args.prefix, args.max_length, download_dir)
 
-    print(f"Found {len(links)} link(s). Downloading to: {DOWNLOAD_DIR}")
+    print(f"Found {len(links)} link(s). Downloading to: {download_dir}")
     if args.prefix:
         print(f"  Prefix:          {args.prefix}")
     print(f"  Max title length: {args.max_length}")
-    print(f"  Format:          H264 video + AAC audio (MP4)\n")
+    print(f"  Workers:          {args.workers}")
+    print(f"  Format:           H264 video + AAC audio (MP4)\n")
 
-    metadata_rows = []
+    # executor.map preserves input order, so the CSV rows stay in sync with
+    # download-list.txt even though downloads run concurrently.
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        metadata_rows = list(executor.map(
+            lambda link: download_one(link, opts, args.prefix, args.max_length),
+            links,
+        ))
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        # Post-processors run in registration order:
-        #   1. EnsureH264  — re-encode to H264/AAC if needed
-        #   2. Rename      — apply clean filename
-        #   3. Metadata    — capture final filename and video info for CSV
-        ydl.add_post_processor(EnsureH264PostProcessor(), when="post_process")
-        ydl.add_post_processor(
-            RenamePostProcessor(args.prefix, args.max_length),
-            when="post_process",
-        )
-        collector = MetadataCollector()
-        ydl.add_post_processor(collector, when="post_process")
-
-        # Download one video at a time to preserve input-file order in the CSV
-        for link in links:
-            collector.last_entry = None
-            ydl.download([link])
-
-            if collector.last_entry:
-                metadata_rows.append(collector.last_entry)
-            else:
-                # Download failed — still include the row so CSV matches input
-                metadata_rows.append({
-                    "filename": "",
-                    "title": "",
-                    "channel": "",
-                    "upload_date": "",
-                    "url": link,
-                })
-
-    csv_path = DOWNLOAD_DIR / "metadata.csv"
+    csv_path = download_dir / "metadata.csv"
     write_metadata_csv(metadata_rows, csv_path)
     print(f"\nMetadata written to: {csv_path}")
 
