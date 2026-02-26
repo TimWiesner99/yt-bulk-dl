@@ -19,6 +19,9 @@ has fewer issues with throttling, and supports more post-processing options.
 import sys
 import os
 import re
+import csv
+import json
+import subprocess
 import argparse
 from pathlib import Path
 
@@ -75,6 +78,88 @@ def rename_file(filepath: str, prefix: str | None, max_len: int) -> str:
     extension = ".".join(ext_parts)
 
     return str(path.parent / f"{stem}.{extension}")
+
+
+class EnsureH264PostProcessor(yt_dlp.postprocessor.PostProcessor):
+    """
+    Re-encode video to H264/AAC if the downloaded streams use different codecs.
+
+    YouTube often serves AV1 or VP9 video and Opus audio.  These formats are
+    not universally supported by all devices and editors, so this PP ensures
+    the final file is always H264 video + AAC audio inside an MP4 container.
+    If the file is already H264+AAC it is left untouched (no quality loss).
+    """
+
+    def run(self, info: dict):
+        filepath = info.get("filepath", "")
+        if not filepath or not Path(filepath).exists():
+            return [], info
+
+        video_codec, audio_codec = self._probe_codecs(filepath)
+        needs_video = video_codec != "h264"
+        needs_audio = audio_codec != "aac"
+
+        if not needs_video and not needs_audio:
+            return [], info
+
+        if needs_video and needs_audio:
+            msg = f"Re-encoding: video {video_codec}→h264, audio {audio_codec}→aac"
+        elif needs_video:
+            msg = f"Re-encoding video: {video_codec}→h264"
+        else:
+            msg = f"Re-encoding audio: {audio_codec}→aac"
+        self.to_screen(msg)
+
+        old_path = Path(filepath)
+        temp_path = old_path.with_suffix(".tmp.mp4")
+
+        cmd = ["ffmpeg", "-i", str(old_path), "-y"]
+        if needs_video:
+            cmd.extend(["-c:v", "libx264", "-preset", "medium", "-crf", "18"])
+        else:
+            cmd.extend(["-c:v", "copy"])
+        if needs_audio:
+            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+        else:
+            cmd.extend(["-c:a", "copy"])
+        cmd.extend(["-movflags", "+faststart", str(temp_path)])
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            old_path.unlink()
+            temp_path.rename(old_path)
+        except subprocess.CalledProcessError as e:
+            self.report_warning(
+                f"ffmpeg re-encode failed: {e.stderr.decode(errors='replace')[:500]}"
+            )
+            if temp_path.exists():
+                temp_path.unlink()
+
+        return [], info
+
+    @staticmethod
+    def _probe_codecs(filepath: str) -> tuple[str, str]:
+        """Use ffprobe to detect video and audio codec names."""
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "quiet", "-print_format", "json",
+                    "-show_streams", filepath,
+                ],
+                capture_output=True, text=True, check=True,
+            )
+            streams = json.loads(result.stdout).get("streams", [])
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            return ("unknown", "unknown")
+
+        video_codec = "unknown"
+        audio_codec = "unknown"
+        for s in streams:
+            if s.get("codec_type") == "video" and video_codec == "unknown":
+                video_codec = s.get("codec_name", "unknown")
+            elif s.get("codec_type") == "audio" and audio_codec == "unknown":
+                audio_codec = s.get("codec_name", "unknown")
+        return (video_codec, audio_codec)
 
 
 class RenamePostProcessor(yt_dlp.postprocessor.PostProcessor):
@@ -136,10 +221,55 @@ def _unique_path(path: Path) -> Path:
     return path
 
 
+class MetadataCollector(yt_dlp.postprocessor.PostProcessor):
+    """Collect video metadata for CSV export.  Runs last so it captures the
+    final (renamed) filepath."""
+
+    def __init__(self):
+        super().__init__()
+        self.last_entry: dict | None = None
+
+    def run(self, info: dict):
+        upload_date = info.get("upload_date", "")
+        if len(upload_date) == 8:
+            upload_date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
+
+        self.last_entry = {
+            "filename": Path(info.get("filepath", "")).name,
+            "title": info.get("title", ""),
+            "channel": info.get("channel", info.get("uploader", "")),
+            "upload_date": upload_date,
+            "url": info.get("original_url", info.get("webpage_url", "")),
+        }
+        return [], info
+
+
+def write_metadata_csv(rows: list[dict], output_path: Path):
+    """Write video metadata to a CSV file preserving input link order."""
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "youtube_title", "channel", "upload_date", "youtube_url"])
+        for row in rows:
+            writer.writerow([
+                row.get("filename", ""),
+                row.get("title", ""),
+                row.get("channel", ""),
+                row.get("upload_date", ""),
+                row.get("url", ""),
+            ])
+
+
 def build_opts(prefix: str | None, max_len: int) -> dict:
     """Construct the full yt-dlp options dict."""
     return {
-        "format": "bestvideo+bestaudio/best",
+        # Prefer H264 (avc1) video + AAC audio; fall back to best available
+        # (the EnsureH264PostProcessor will re-encode non-H264 streams)
+        "format": (
+            "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+            "bestvideo[vcodec^=avc1]+bestaudio/"
+            "bestvideo+bestaudio/"
+            "best"
+        ),
         "merge_output_format": "mp4",
         "outtmpl": build_outtmpl(prefix, max_len),
         "ignoreerrors": True,
@@ -204,15 +334,44 @@ def main():
     print(f"Found {len(links)} link(s). Downloading to: {DOWNLOAD_DIR}")
     if args.prefix:
         print(f"  Prefix:          {args.prefix}")
-    print(f"  Max title length: {args.max_length}\n")
+    print(f"  Max title length: {args.max_length}")
+    print(f"  Format:          H264 video + AAC audio (MP4)\n")
+
+    metadata_rows = []
 
     with yt_dlp.YoutubeDL(opts) as ydl:
-        # Register our renamer as a post-processor so it runs after merge
+        # Post-processors run in registration order:
+        #   1. EnsureH264  — re-encode to H264/AAC if needed
+        #   2. Rename      — apply clean filename
+        #   3. Metadata    — capture final filename and video info for CSV
+        ydl.add_post_processor(EnsureH264PostProcessor(), when="post_process")
         ydl.add_post_processor(
             RenamePostProcessor(args.prefix, args.max_length),
             when="post_process",
         )
-        ydl.download(links)
+        collector = MetadataCollector()
+        ydl.add_post_processor(collector, when="post_process")
+
+        # Download one video at a time to preserve input-file order in the CSV
+        for link in links:
+            collector.last_entry = None
+            ydl.download([link])
+
+            if collector.last_entry:
+                metadata_rows.append(collector.last_entry)
+            else:
+                # Download failed — still include the row so CSV matches input
+                metadata_rows.append({
+                    "filename": "",
+                    "title": "",
+                    "channel": "",
+                    "upload_date": "",
+                    "url": link,
+                })
+
+    csv_path = DOWNLOAD_DIR / "metadata.csv"
+    write_metadata_csv(metadata_rows, csv_path)
+    print(f"\nMetadata written to: {csv_path}")
 
     print("\nAll done!")
 
