@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 Bulk YouTube Video Downloader
-Reads YouTube links from 'download-list.txt' (one per line) and downloads
-each video in the highest available quality. Downloads are parallelised across
-multiple worker threads so that several videos are fetched simultaneously.
+Opens a text file for pasting YouTube links, then downloads each video in the
+highest available quality. Downloads are parallelised across multiple worker
+threads so that several videos are fetched simultaneously.
 
 Usage:
     python yt_bulk_download.py                          # basic download (4 workers)
@@ -13,6 +13,7 @@ Usage:
 
 Requirements:
     pip install yt-dlp
+    ffmpeg must be installed and on PATH
 
 Note: yt-dlp is the actively maintained successor to youtube-dl. It's faster,
 has fewer issues with throttling, and supports more post-processing options.
@@ -23,9 +24,12 @@ import os
 import re
 import csv
 import json
+import shutil
 import subprocess
 import argparse
 import datetime
+import platform
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -39,10 +43,24 @@ except ImportError:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 BASE_DOWNLOAD_DIR = Path.home() / "Downloads" / "yt-bulk download"
-LINK_FILE = SCRIPT_DIR / "download-list.txt"
 
 DEFAULT_MAX_TITLE_LEN = 40
 DEFAULT_WORKERS = 4
+
+
+def check_ffmpeg():
+    """Verify that ffmpeg is installed and on PATH. Exit with instructions if not."""
+    if shutil.which("ffmpeg"):
+        return
+    print("Error: ffmpeg is not installed or not found on PATH.")
+    print("ffmpeg is required to merge and re-encode video/audio streams.\n")
+    print("Install it for your platform:")
+    print("  Windows:              winget install ffmpeg")
+    print("                    or  download from https://ffmpeg.org/download.html")
+    print("  macOS:                brew install ffmpeg")
+    print("  Linux (Debian/Ubuntu): sudo apt install ffmpeg")
+    print("  Linux (Fedora):       sudo dnf install ffmpeg")
+    sys.exit(1)
 
 # Lock that serialises the check-then-rename step inside RenamePostProcessor
 # to prevent TOCTOU races when two threads try to rename to the same filename.
@@ -297,14 +315,55 @@ def build_opts(prefix: str | None, max_len: int, download_dir: Path) -> dict:
     }
 
 
-def load_links(path: Path) -> list[str]:
-    """Read non-empty, non-comment lines from the link file."""
-    if not path.exists():
-        print(f"Error: '{path}' not found. Create it with one YouTube URL per line.")
-        sys.exit(1)
+def _open_in_editor(filepath: str):
+    """Open a file in the system's default text editor (best-effort, cross-platform)."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            os.startfile(filepath)
+        elif system == "Darwin":
+            subprocess.Popen(["open", filepath])
+        else:
+            editor = os.environ.get("EDITOR")
+            if editor:
+                subprocess.Popen([editor, filepath])
+            else:
+                subprocess.Popen(["xdg-open", filepath])
+    except OSError:
+        print(f"Could not open editor automatically. Please open this file manually:\n  {filepath}")
+
+
+def prompt_for_links() -> list[str]:
+    """Create a temp file, open it in an editor, and read back YouTube URLs."""
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".txt",
+        prefix="yt-bulk-dl_",
+        delete=False,
+        encoding="utf-8",
+    )
+    tmp.write("# Paste your YouTube URLs below, one per line.\n")
+    tmp.write("# Lines starting with # are ignored.\n")
+    tmp.write("# Save this file, then press Enter in the console to start downloading.\n\n")
+    tmp.close()
+
+    _open_in_editor(tmp.name)
+
+    print(f"A text file has been opened for editing:\n  {tmp.name}\n")
+    print("Paste your YouTube URLs (one per line), save the file,")
+    input("then press Enter here to start downloading...")
+    print()
+
+    try:
+        text = Path(tmp.name).read_text(encoding="utf-8")
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
     links = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
             links.append(stripped)
@@ -358,9 +417,11 @@ def download_one(link: str, opts: dict, prefix: str | None, max_len: int) -> dic
 def main():
     args = parse_args()
 
-    links = load_links(LINK_FILE)
+    check_ffmpeg()
+
+    links = prompt_for_links()
     if not links:
-        print("No links found in download-list.txt — nothing to do.")
+        print("No links found — nothing to do.")
         return
 
     batch_ts = datetime.datetime.now().strftime("%y-%m-%d %H-%M")
@@ -392,4 +453,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nDownload cancelled by user.")
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+    finally:
+        input("\nPress Enter to exit...")
